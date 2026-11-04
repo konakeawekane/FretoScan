@@ -1,20 +1,24 @@
-# Project Overview
+# Scan
 
-The project is a part of the BYU Idaho buildathon (mini relaxed hackathon) going on this week. The basis of the project is a free accessable and possibly educational tool for simulating the acoustic properties of a given space both virtual and scaned. The project is meant to be easy to use and understand.
+A static Three.js site for live camera capture. Scan records the device camera and available motion readings. Geometry reconstruction is the next phase.
 
-## Getting started
+## Run
 
-No package manager or build step is required. Just serve the files. Example python server:
+No package manager or build step is required. For desktop testing:
 
 ```bash
 python -m http.server 8000
 ```
 
-## Structure
+Open `http://localhost:8000`. To use a phone, serve the site over HTTPS; a plain `http://` address on your local network will not grant camera access. Three.js currently loads from a CDN.
+
+Tap **Scan** to start and stop capture. After stopping, save the video and scan data separately. The JSON contains video-frame timestamps and motion readings when available. Everything stays on the device until you download it.
+
+## Files
 
 ```text
-src/
-├── main.js                 # Application entry point
-└── styles/
-    └── main.css            # Application styles
+index.html           Page and tools
+src/main.js          Capture and UI
+src/scene/Viewport.js Three.js viewport and camera preview
+src/styles/main.css  Interface styles
 ```
