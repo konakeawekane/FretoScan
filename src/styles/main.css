@@ -35,5 +35,11 @@ button:focus-visible { outline: 2px solid #a3e8ff; outline-offset: 3px; }
 .indicator--active { background: #ff5f65; box-shadow: 0 0 0 4px #ff5f6533; }
 #message { overflow: hidden; text-overflow: ellipsis; }
 #timer { padding-left: 4px; font-variant-numeric: tabular-nums; }
+.status-button { position: relative; width: 26px; height: 26px; margin: -4px -7px -4px 2px; border: 0; border-radius: 50%; background: #ffffff22; cursor: pointer; }
+.status-button:disabled { opacity: .4; cursor: not-allowed; }
+.calibration-panel { top: auto; bottom: calc(65px + env(safe-area-inset-bottom)); }
+.calibration-panel label { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 10px; font-size: 12px; }
+.calibration-panel input { position: relative; width: 100%; margin-bottom: 12px; accent-color: #a3e8ff; }
+.calibration-panel p { margin-bottom: 0; }
 
 @media (max-width: 480px) { .recording-panel { left: 50%; right: auto; bottom: calc(67px + env(safe-area-inset-bottom)); transform: translateX(-50%); } }

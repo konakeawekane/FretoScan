@@ -25,6 +25,11 @@ let busy = false;
 let processing = false;
 let lastScanAt = 0;
 let sessionId = 0;
+let motionCursor = 0;
+const fovInput = $('#fov');
+const storedFov = Number(localStorage.getItem('scan-fov'));
+if (storedFov >= 40 && storedFov <= 100) fovInput.value = storedFov;
+$('#fov-value').textContent = `${fovInput.value}°`;
 
 function status(message, active = false) {
   $('#message').textContent = message;
@@ -52,25 +57,33 @@ view.onSelectionChange = updateMeshUI;
 worker.onmessage = ({ data }) => {
   if (data.sessionId !== sessionId) return;
   processing = false;
+  if (data.pose) view.setPose(data.pose, data.focal, data.width);
+  if (data.tracks) view.setTracks(data.tracks, data.width, data.height, data.metrics.tracking);
   if (data.type === 'patch') {
-    view.setPose(data.pose, data.focal, data.width);
     const added = view.addPatch(data.positions, data.colors);
     updateMeshUI();
-    status(added ? `${view.triangles} triangles scanned` : 'Move to a new part of the scene', true);
+    status(added ? `K${data.metrics.keyframes} · ${data.metrics.inliers} tracks · ${view.triangles} faces` : 'Move to a new part of the scene', true);
+  } else if (data.type === 'volume') {
+    view.replaceMesh(data.positions, data.colors);
+    updateMeshUI();
+    status(`K${data.metrics.keyframes} · ${data.metrics.depthPixels} depth · ${view.triangles} faces`, true);
   } else status(data.message, Boolean(stream));
+  if (data.metrics) $('#message').title = `${data.metrics.tracking || 'searching'} tracking · ${data.metrics.keyframes} keyframes · ${data.metrics.matches} matches · ${data.metrics.inliers || 0} inliers · ${data.metrics.landmarks} landmarks · ${data.metrics.depthPixels || 0} depth pixels · ${data.metrics.voxels} voxels`;
 };
 worker.onerror = () => { processing = false; status('Reconstruction failed; restart the scan'); };
 
 function processFrame(now) {
-  if (!stream || processing || now - lastScanAt < 450 || view.triangles >= view.limit || !video.videoWidth) return;
+  if (!stream || processing || now - lastScanAt < 450 || !video.videoWidth) return;
   const scale = 320 / Math.max(video.videoWidth, video.videoHeight);
   const width = Math.round(video.videoWidth * scale), height = Math.round(video.videoHeight * scale);
   if (sampleCanvas.width !== width || sampleCanvas.height !== height) { sampleCanvas.width = width; sampleCanvas.height = height; }
   sampleContext.drawImage(video, 0, 0, width, height);
   const rgba = sampleContext.getImageData(0, 0, width, height).data;
+  const samples = motion.slice(motionCursor);
+  motionCursor = motion.length;
   processing = true;
   lastScanAt = now;
-  worker.postMessage({ type: 'frame', sessionId, width, height, rgba }, [rgba.buffer]);
+  worker.postMessage({ type: 'frame', sessionId, width, height, rgba, motion: samples }, [rgba.buffer]);
 }
 
 function elapsed() {
@@ -130,13 +143,17 @@ async function start(replace = false) {
     sessionId++;
     processing = false;
     lastScanAt = 0;
-    worker.postMessage({ type: 'reset', sessionId });
+    worker.postMessage({ type: 'reset', sessionId, fov: Number(fovInput.value) });
     view.showCamera(video);
     chunks = [];
     motion = [];
+    motionCursor = 0;
     frames = [];
     savedCapture = null;
     $('#recording-panel').hidden = true;
+    $('#calibration-panel').hidden = true;
+    $('#calibrate').disabled = true;
+    $('#calibrate').setAttribute('aria-expanded', 'false');
     startedAt = performance.now();
     if (await motionPermission === 'granted') window.addEventListener('devicemotion', onMotion);
     const options = recorderOptions();
@@ -179,6 +196,7 @@ async function start(replace = false) {
   } finally {
     busy = false;
     scanButton.disabled = false;
+    if (!stream) $('#calibrate').disabled = false;
   }
 }
 
@@ -231,6 +249,7 @@ async function stop() {
     scanButton.querySelector('span').textContent = 'Scan';
     $('#timer').hidden = true;
     scanButton.disabled = false;
+    $('#calibrate').disabled = false;
     busy = false;
   }
 }
@@ -248,11 +267,19 @@ function download(blob, filename) {
 
 scanButton.addEventListener('click', () => stream ? stop() : start());
 for (const key of ['erase', 'export']) {
-  $(`#${key}`).addEventListener('click', () => {
+  $(`#${key}`).addEventListener('click', async () => {
+    if (stream) await stop();
     $('#replace-panel').hidden = true;
     mode(panels[key].hidden ? key : undefined);
   });
 }
+$('#calibrate').addEventListener('click', () => {
+  const panel = $('#calibration-panel');
+  panel.hidden = !panel.hidden;
+  $('#calibrate').setAttribute('aria-expanded', String(!panel.hidden));
+});
+fovInput.addEventListener('input', () => { $('#fov-value').textContent = `${fovInput.value}°`; });
+fovInput.addEventListener('change', () => { localStorage.setItem('scan-fov', fovInput.value); status('Calibration saved for next scan'); });
 $('#replace').addEventListener('click', () => start(true));
 $('#keep').addEventListener('click', () => { $('#replace-panel').hidden = true; });
 $('#delete-selection').addEventListener('click', () => { view.deleteSelection(); updateMeshUI(); status(`${view.triangles} triangles remain`); });

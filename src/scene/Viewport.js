@@ -27,7 +27,7 @@ export class Viewport {
     this.selected = new Map();
     this.seen = new Set();
     this.triangles = 0;
-    this.limit = 12000;
+    this.limit = 18000;
     this.eraseMode = false;
     this.cameraActive = false;
     this.raycaster = new THREE.Raycaster();
@@ -47,6 +47,13 @@ export class Viewport {
     this.backgroundPlane = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshBasicMaterial());
     this.background.add(this.backgroundPlane);
     this.backgroundPlane.visible = false;
+    this.trackingPoints = new THREE.Points(
+      new THREE.BufferGeometry(),
+      new THREE.PointsMaterial({ color: 0x9df7dd, size: 4, sizeAttenuation: false, depthTest: false }),
+    );
+    this.trackingPoints.visible = false;
+    this.trackingPoints.renderOrder = 1;
+    this.background.add(this.trackingPoints);
 
     this.resize = this.resize.bind(this);
     window.addEventListener('resize', this.resize);
@@ -65,6 +72,8 @@ export class Viewport {
 
   showCamera(video) {
     this.video = video;
+    this.trackData = null;
+    this.trackingPoints.visible = false;
     this.focalVideo = null;
     this.cameraActive = true;
     this.controls.enabled = false;
@@ -79,7 +88,9 @@ export class Viewport {
 
   hideCamera() {
     this.cameraActive = false;
+    this.trackData = null;
     this.backgroundPlane.visible = false;
+    this.trackingPoints.visible = false;
     this.backgroundPlane.material.map = null;
     this.backgroundPlane.material.needsUpdate = true;
     this.texture?.dispose();
@@ -105,16 +116,38 @@ export class Viewport {
     this.resize();
   }
 
-  addPatch(positions, colors) {
+  setTracks(tracks, width, height, tracking) {
+    if (!this.cameraActive) return;
+    this.trackData = { tracks, width, height };
+    this.trackingPoints.material.color.setHex(tracking === 'anchored' ? 0x9df7dd : 0xffd68a);
+    this.updateTracks();
+  }
+
+  updateTracks() {
+    if (!this.trackData || !this.cameraActive) return;
+    const { tracks, width, height } = this.trackData;
+    const sx = this.backgroundPlane.scale.x, sy = this.backgroundPlane.scale.y;
+    const stride = Math.max(2, Math.ceil(tracks.length / 300) * 2);
+    const positions = [];
+    for (let i = 0; i < tracks.length; i += stride) {
+      positions.push((tracks[i] / width * 2 - 1) * sx, (1 - tracks[i + 1] / height * 2) * sy, 0.05);
+    }
+    this.trackingPoints.geometry.dispose();
+    this.trackingPoints.geometry = new THREE.BufferGeometry();
+    this.trackingPoints.geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    this.trackingPoints.visible = positions.length > 0;
+  }
+
+  addPatch(positions, colors, deduplicate = true) {
     const keptPositions = [], keptColors = [], keptKeys = [];
     for (let face = 0; face < positions.length / 9 && this.triangles + keptPositions.length / 9 < this.limit; face++) {
       const offset = face * 9;
       const x = (positions[offset] + positions[offset + 3] + positions[offset + 6]) / 3;
       const y = (positions[offset + 1] + positions[offset + 4] + positions[offset + 7]) / 3;
       const z = (positions[offset + 2] + positions[offset + 5] + positions[offset + 8]) / 3;
-      const key = [x, y, z].map((value) => Math.round(value / 0.06)).join(':');
-      if (this.seen.has(key)) continue;
-      this.seen.add(key);
+      const key = deduplicate ? [x, y, z].map((value) => Math.round(value / 0.06)).join(':') : `fused:${face}`;
+      if (deduplicate && this.seen.has(key)) continue;
+      if (deduplicate) this.seen.add(key);
       keptKeys.push(key);
       for (let i = 0; i < 9; i++) { keptPositions.push(positions[offset + i]); keptColors.push(colors[offset + i]); }
     }
@@ -203,6 +236,11 @@ export class Viewport {
     this.seen.clear();
   }
 
+  replaceMesh(positions, colors) {
+    this.clearMesh();
+    this.addPatch(positions, colors, false);
+  }
+
   async exportMesh(format) {
     this.clearSelection();
     if (format === 'obj') {
@@ -229,6 +267,7 @@ export class Viewport {
     if (this.video?.videoWidth) {
       const ratio = (this.video.videoWidth / this.video.videoHeight) / (width / height);
       this.backgroundPlane.scale.set(Math.max(1, ratio), Math.max(1, 1 / ratio), 1);
+      this.updateTracks();
     }
   }
 }

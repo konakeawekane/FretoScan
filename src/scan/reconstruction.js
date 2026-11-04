@@ -89,19 +89,19 @@ export function triangulate(a, b, R, t) {
   return point;
 }
 
-export function estimatePose(pairs, width, height, random = Math.random) {
+export function estimatePose(pairs, width, height, random = Math.random, focal = Math.max(width, height) * 0.9) {
   if (pairs.length < 20) return null;
-  const focal = Math.max(width, height) * 0.9;
   const matches = pairs.map(({ x1, y1, x2, y2 }) => ({
-    x: x1, y: y1,
+    x: x1, y: y1, x2, y2,
     a: [(x1 - width / 2) / focal, (height / 2 - y1) / focal, 1],
     b: [(x2 - width / 2) / focal, (height / 2 - y2) / focal, 1],
   }));
   const threshold = (2.5 / focal) ** 2;
   let best = [];
-  for (let iteration = 0; iteration < 120; iteration++) {
+  for (let iteration = 0; iteration < 320; iteration++) {
     const sample = new Set();
-    while (sample.size < 8) sample.add(Math.floor(random() * matches.length));
+    const pool = iteration < 160 ? Math.max(20, Math.floor(matches.length * 0.65)) : matches.length;
+    while (sample.size < 8) sample.add(Math.floor(random() * pool));
     const e = fit(Array.from(sample, (i) => matches[i]));
     const inliers = matches.filter((match) => error(e, match) < threshold);
     if (inliers.length > best.length) best = inliers;

@@ -70,10 +70,18 @@
     </div>
   </section>
 
+  <section id="calibration-panel" class="panel glass calibration-panel" aria-label="Camera calibration" hidden>
+    <h2>Camera field of view</h2>
+    <label for="fov">Longest image dimension <output id="fov-value">58°</output></label>
+    <input id="fov" type="range" min="40" max="100" value="58">
+    <p>Use your camera's value if known. A new scan applies changes.</p>
+  </section>
+
   <div class="status glass" role="status" aria-live="polite">
     <span id="indicator" class="indicator"></span>
     <span id="message">Tap Scan to use your camera</span>
     <time id="timer" hidden>00:00</time>
+    <button id="calibrate" class="status-button" type="button" aria-label="Camera calibration" aria-expanded="false">⚙</button>
   </div>
 </body>
 </html>
