@@ -4,6 +4,9 @@ const $ = (selector) => document.querySelector(selector);
 const view = new Viewport($('#viewport'));
 const scanButton = $('#scan');
 const panels = { erase: $('#erase-panel'), export: $('#export-panel') };
+const worker = new Worker(new URL('./scan/worker.js', import.meta.url), { type: 'module' });
+const sampleCanvas = document.createElement('canvas');
+const sampleContext = sampleCanvas.getContext('2d', { willReadFrequently: true });
 const video = document.createElement('video');
 video.muted = true;
 video.autoplay = true;
@@ -19,6 +22,9 @@ let startedAt = 0;
 let frameRequest;
 let timer;
 let busy = false;
+let processing = false;
+let lastScanAt = 0;
+let sessionId = 0;
 
 function status(message, active = false) {
   $('#message').textContent = message;
@@ -28,6 +34,43 @@ function status(message, active = false) {
 function mode(name) {
   for (const [key, panel] of Object.entries(panels)) panel.hidden = key !== name;
   for (const key of ['erase', 'export']) $(`#${key}`).setAttribute('aria-pressed', String(key === name));
+  view.setEraseMode(name === 'erase');
+}
+
+function updateMeshUI() {
+  const count = view.triangles;
+  const selected = view.selectionCount;
+  $('#erase-message').textContent = count ? selected ? `${selected} triangle${selected === 1 ? '' : 's'} selected` : 'Brush over triangles to select them.' : 'Scan geometry, then brush over triangles to select them.';
+  $('#delete-selection').disabled = selected === 0;
+  $('#clear-selection').disabled = selected === 0;
+  $('#export-message').textContent = count ? `${count} triangles ready to download.` : 'Scan geometry before exporting.';
+  $('#export-glb').disabled = count === 0;
+  $('#export-obj').disabled = count === 0;
+}
+
+view.onSelectionChange = updateMeshUI;
+worker.onmessage = ({ data }) => {
+  if (data.sessionId !== sessionId) return;
+  processing = false;
+  if (data.type === 'patch') {
+    view.setPose(data.pose, data.focal, data.width);
+    const added = view.addPatch(data.positions, data.colors);
+    updateMeshUI();
+    status(added ? `${view.triangles} triangles scanned` : 'Move to a new part of the scene', true);
+  } else status(data.message, Boolean(stream));
+};
+worker.onerror = () => { processing = false; status('Reconstruction failed; restart the scan'); };
+
+function processFrame(now) {
+  if (!stream || processing || now - lastScanAt < 450 || view.triangles >= view.limit || !video.videoWidth) return;
+  const scale = 320 / Math.max(video.videoWidth, video.videoHeight);
+  const width = Math.round(video.videoWidth * scale), height = Math.round(video.videoHeight * scale);
+  if (sampleCanvas.width !== width || sampleCanvas.height !== height) { sampleCanvas.width = width; sampleCanvas.height = height; }
+  sampleContext.drawImage(video, 0, 0, width, height);
+  const rgba = sampleContext.getImageData(0, 0, width, height).data;
+  processing = true;
+  lastScanAt = now;
+  worker.postMessage({ type: 'frame', sessionId, width, height, rgba }, [rgba.buffer]);
 }
 
 function elapsed() {
@@ -49,6 +92,7 @@ function onMotion(event) {
 function sampleFrame(now, metadata) {
   if (!stream) return;
   if (recorder?.state === 'recording') frames.push({ tMs: Math.round(now - startedAt), mediaTime: metadata.mediaTime });
+  processFrame(now);
   frameRequest = video.requestVideoFrameCallback(sampleFrame);
 }
 
@@ -59,9 +103,9 @@ function recorderOptions() {
   return mimeType ? { mimeType } : {};
 }
 
-async function start() {
+async function start(replace = false) {
   if (busy || stream) return;
-  if (savedCapture) {
+  if (!replace && (savedCapture || view.triangles)) {
     $('#replace-panel').hidden = false;
     return;
   }
@@ -81,6 +125,12 @@ async function start() {
     });
     video.srcObject = stream;
     await video.play();
+    view.clearMesh();
+    updateMeshUI();
+    sessionId++;
+    processing = false;
+    lastScanAt = 0;
+    worker.postMessage({ type: 'reset', sessionId });
     view.showCamera(video);
     chunks = [];
     motion = [];
@@ -104,7 +154,7 @@ async function start() {
     scanButton.querySelector('span').textContent = 'Stop';
     $('#timer').hidden = false;
     elapsed();
-    timer = setInterval(elapsed, 500);
+    timer = setInterval(() => { elapsed(); if (!video.requestVideoFrameCallback) processFrame(performance.now()); }, 500);
     status(recorder ? 'Recording camera locally' : 'Camera live · recording unavailable', true);
   } catch (error) {
     clearInterval(timer);
@@ -114,6 +164,8 @@ async function start() {
     if (recorder?.state === 'recording') recorder.stop();
     stream?.getTracks().forEach((track) => track.stop());
     stream = null;
+    sessionId++;
+    processing = false;
     recorder = null;
     video.pause();
     video.srcObject = null;
@@ -138,6 +190,8 @@ async function stop() {
   window.removeEventListener('devicemotion', onMotion);
   if (frameRequest !== undefined) video.cancelVideoFrameCallback?.(frameRequest);
   frameRequest = undefined;
+  sessionId++;
+  processing = false;
   try {
     if (recorder?.state === 'recording') {
       await new Promise((resolve) => {
@@ -199,8 +253,21 @@ for (const key of ['erase', 'export']) {
     mode(panels[key].hidden ? key : undefined);
   });
 }
-$('#replace').addEventListener('click', () => { savedCapture = null; start(); });
+$('#replace').addEventListener('click', () => start(true));
 $('#keep').addEventListener('click', () => { $('#replace-panel').hidden = true; });
+$('#delete-selection').addEventListener('click', () => { view.deleteSelection(); updateMeshUI(); status(`${view.triangles} triangles remain`); });
+$('#clear-selection').addEventListener('click', () => view.clearSelection());
+for (const format of ['glb', 'obj']) {
+  $(`#export-${format}`).addEventListener('click', async () => {
+    if (!view.triangles) return;
+    status('Preparing mesh…');
+    try {
+      const blob = await view.exportMesh(format);
+      download(blob, `scan-mesh.${format}`);
+      status(`${format.toUpperCase()} ready`);
+    } catch (error) { status(`Export failed: ${error.message}`); }
+  });
+}
 $('#save-video').addEventListener('click', () => {
   if (savedCapture) download(savedCapture.video, `${savedCapture.name}.${savedCapture.video.type.includes('mp4') ? 'mp4' : 'webm'}`);
 });

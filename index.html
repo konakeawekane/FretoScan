@@ -7,7 +7,7 @@
   <title>Scan</title>
   <link rel="stylesheet" href="./src/styles/main.css">
   <script type="importmap">
-    {"imports":{"three":"https://unpkg.com/three@0.181.0/build/three.module.js"}}
+    {"imports":{"three":"https://unpkg.com/three@0.181.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.181.0/examples/jsm/"}}
   </script>
   <script type="module" src="./src/main.js"></script>
 </head>
@@ -39,16 +39,19 @@
 
   <section id="erase-panel" class="panel glass" aria-label="Erase tools" hidden>
     <h2>Erase</h2>
-    <p>No geometry to select yet.</p>
-    <button class="action" type="button" disabled>Delete selection</button>
+    <p id="erase-message">Scan geometry, then brush over triangles to select them.</p>
+    <div class="options">
+      <button id="delete-selection" class="action" type="button" disabled>Delete selection</button>
+      <button id="clear-selection" class="action" type="button" disabled>Clear</button>
+    </div>
   </section>
 
   <section id="export-panel" class="panel glass" aria-label="Export options" hidden>
     <h2>Export mesh</h2>
-    <p>Scan geometry before exporting.</p>
+    <p id="export-message">Scan geometry before exporting.</p>
     <div class="options">
-      <button class="action" type="button" disabled>GLB</button>
-      <button class="action" type="button" disabled>OBJ</button>
+      <button id="export-glb" class="action" type="button" disabled>GLB</button>
+      <button id="export-obj" class="action" type="button" disabled>OBJ</button>
     </div>
   </section>
 
@@ -59,8 +62,8 @@
   </section>
 
   <section id="replace-panel" class="panel glass" aria-label="New scan confirmation" hidden>
-    <h2>Previous recording</h2>
-    <p>Save it before starting a new scan. Starting again replaces it.</p>
+    <h2>Previous scan</h2>
+    <p>Save its video and mesh before starting again. A new scan replaces them.</p>
     <div class="options">
       <button id="replace" class="action" type="button">Start new</button>
       <button id="keep" class="action" type="button">Keep recording</button>
