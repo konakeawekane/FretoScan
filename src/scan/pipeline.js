@@ -1,163 +1,149 @@
 import { grayscale, detect, match } from './features.js';
-import { estimatePose, meshFaces, initialPose, advancePose, mul3, transpose3 } from './reconstruction.js';
+import { estimatePose, initialPose, advancePose, mul3, transpose3 } from './reconstruction.js';
 import { refinePose, worldPoints } from './tracking.js';
-import { estimateDenseDepth } from './depth.js';
-import { TsdfVolume } from './volume.js';
 
-const id = ({ x, y }) => `${x}:${y}`;
+const key = ({ x, y }) => `${x}:${y}`;
 const median = (values) => values.sort((a, b) => a - b)[Math.floor(values.length / 2)];
+
+function consistent(pairs, random) {
+  if (pairs.length < 12) return pairs;
+  let best = [];
+  for (let iteration = 0; iteration < 60; iteration++) {
+    const first = pairs[Math.floor(random() * pairs.length)];
+    const second = pairs[Math.floor(random() * pairs.length)];
+    const dx = second.x1 - first.x1, dy = second.y1 - first.y1;
+    const distance = dx * dx + dy * dy;
+    if (distance < 400) continue;
+    const ux = second.x2 - first.x2, uy = second.y2 - first.y2;
+    const a = (ux * dx + uy * dy) / distance;
+    const b = (uy * dx - ux * dy) / distance;
+    if (Math.hypot(a, b) < 0.7 || Math.hypot(a, b) > 1.35) continue;
+    const tx = first.x2 - a * first.x1 + b * first.y1;
+    const ty = first.y2 - b * first.x1 - a * first.y1;
+    const inliers = pairs.filter((pair) => Math.hypot(a * pair.x1 - b * pair.y1 + tx - pair.x2,
+      b * pair.x1 + a * pair.y1 + ty - pair.y2) < 7);
+    if (inliers.length > best.length) best = inliers;
+  }
+  return best.length >= Math.max(10, pairs.length * 0.45) ? best : pairs;
+}
 
 export class Scanner {
   constructor(fov = 58) {
     this.fov = fov;
     this.pose = initialPose();
     this.previous = null;
-    this.keyframes = [];
-    this.volume = new TsdfVolume();
-    this.misses = 0;
-    this.gyroTravel = 0;
-    this.lastMotionTime = null;
-    this.fused = false;
-    this.keyframeCount = 0;
+    this.keyframe = null;
     this.flow = [0, 0];
+    this.nextId = 0;
+    this.frame = 0;
     this.seed = 7;
     this.random = () => ((this.seed = (this.seed * 1664525 + 1013904223) >>> 0) / 2 ** 32);
   }
 
-  motion(samples = []) {
-    for (const sample of samples) {
-      if (this.lastMotionTime !== null && sample.rotation?.every(Number.isFinite)) {
-        const interval = Math.min(100, Math.max(0, sample.tMs - this.lastMotionTime));
-        this.gyroTravel += Math.hypot(...sample.rotation) * Math.PI / 180 * interval / 1000;
-      }
-      this.lastMotionTime = sample.tMs;
-    }
+  newTracks(features) {
+    const count = Math.min(240, features.length);
+    return Array.from({ length: count }, (_, i) => {
+      const { x, y } = features[Math.floor(i * features.length / count)];
+      return { x, y, id: ++this.nextId };
+    });
   }
 
-  process({ width, height, rgba, motion = [] }) {
-    this.motion(motion);
+  process({ width, height, rgba }) {
     const gray = grayscale(rgba, width, height);
-    const current = { width, height, rgba, gray, features: detect(gray, width, height), landmarks: new Map() };
+    const features = detect(gray, width, height);
     const focal = Math.max(width, height) / (2 * Math.tan(this.fov * Math.PI / 360));
+    const current = { width, height, gray, pose: this.pose, tracks: [] };
+    this.frame++;
     if (!this.previous || this.previous.width !== width || this.previous.height !== height) {
-      current.pose = this.pose;
-      this.previous = current;
-      this.keyframes.push(current);
-      this.keyframeCount++;
-      return { type: 'result', message: 'Move sideways slowly to reveal depth' };
+      current.tracks = this.newTracks(features);
+      this.previous = this.keyframe = current;
+      return { type: 'tracking', tracks: [], trackIds: [], landmarks: [], width, height, focal, metrics: { tracking: 'image', matches: 0, features: current.tracks.length, landmarks: 0 }, message: 'Finding visual features' };
     }
-    const reference = this.previous;
-    let pairs = match(reference.gray, gray, reference.features, width, height, this.flow);
-    if (pairs.length < 25 && (this.flow[0] || this.flow[1])) pairs = match(reference.gray, gray, reference.features, width, height);
-    const metrics = { matches: pairs.length, landmarks: reference.landmarks.size, voxels: this.volume.cells.size, keyframes: this.keyframeCount };
-    const failed = (message) => {
-      if (++this.misses > 2) this.flow = [0, 0];
-      return { type: 'result', message, metrics };
-    };
-    if (pairs.length < 25) return failed('Point at a detailed, well-lit surface');
-    const flows = pairs.map((pair) => Math.hypot(pair.x2 - pair.x1, pair.y2 - pair.y1)).sort((a, b) => a - b);
-    if (flows[Math.floor(flows.length / 2)] < 5) return { type: 'result', message: 'Move sideways slowly to reveal depth', metrics };
-    const landmarkPairs = pairs.flatMap((pair) => {
-      const landmark = reference.landmarks.get(`${pair.x1}:${pair.y1}`);
-      return landmark ? [{ pair, point: landmark.world, x: pair.x2, y: pair.y2 }] : [];
-    });
-    const observations = landmarkPairs;
-    const accept = (pose) => pose && pose.errorPx < 3.2 && pose.inliers >= Math.max(10, observations.length * 0.5)
-      && Math.hypot(...pose.C.map((value, i) => value - reference.pose.C[i])) < 0.8;
-    let predicted = reference.pose;
-    if (landmarkPairs.length >= 8) {
-      const motion = [0, 1].map((axis) => median(landmarkPairs.map(({ pair, point }) => {
-        const depth = mul3(reference.pose.R, point.map((value, i) => value - reference.pose.C[i]))[2];
-        return (axis ? pair.y2 - pair.y1 : pair.x1 - pair.x2) * depth / focal;
-      })));
-      const step = mul3(transpose3(reference.pose.R), [motion[0], motion[1], 0]);
-      predicted = { R: reference.pose.R, C: reference.pose.C.map((value, i) => value + step[i]) };
-    }
-    let refined = refinePose(observations, predicted, focal, width, height);
-    let anchored = Boolean(accept(refined));
-    if (!anchored && predicted !== reference.pose) {
-      const stationary = refinePose(observations, reference.pose, focal, width, height);
-      if (accept(stationary)) { refined = stationary; anchored = true; }
-    }
-    let estimate;
-    if (!anchored) {
-      estimate = estimatePose(pairs, width, height, this.random, focal);
-      if (!estimate) return failed('Tracking uncertain; move slowly and keep surfaces in view');
-      const visualAngle = Math.acos(Math.max(-1, Math.min(1, (estimate.R[0] + estimate.R[4] + estimate.R[8] - 1) / 2)));
-      if (this.gyroTravel > 0.02 && visualAngle > this.gyroTravel + 0.35) return failed('Camera motion inconsistent; move more slowly');
-      const initial = advancePose(reference.pose, estimate);
-      refined = refinePose(observations, initial, focal, width, height);
-      anchored = Boolean(accept(refined));
-      current.pose = anchored ? refined : initial;
-    } else current.pose = refined;
-    const geometryMatches = anchored ? pairs.map((pair) => ({
-      x: pair.x1, y: pair.y1, x2: pair.x2, y2: pair.y2,
-      a: [(pair.x1 - width / 2) / focal, (height / 2 - pair.y1) / focal, 1],
-      b: [(pair.x2 - width / 2) / focal, (height / 2 - pair.y2) / focal, 1],
-    })) : estimate.points;
-    const points = worldPoints(geometryMatches, reference.pose, current.pose, estimate?.points || []);
-    const byPoint = new Map(points.map((point) => [id(point), point]));
-    for (const match of geometryMatches) {
-      const oldWorld = reference.landmarks.get(id(match))?.world;
-      const newWorld = byPoint.get(id(match))?.world;
-      let world = oldWorld || newWorld;
-      if (!world) continue;
-      if (anchored && oldWorld && newWorld && Math.hypot(...oldWorld.map((value, i) => value - newWorld[i])) < 0.08) {
-        world = oldWorld.map((value, i) => value * 0.75 + newWorld[i] * 0.25);
-      }
-      const cameraPoint = mul3(current.pose.R, world.map((value, i) => value - current.pose.C[i]));
-      if (cameraPoint[2] <= 0 || Math.hypot(width / 2 + focal * cameraPoint[0] / cameraPoint[2] - match.x2,
-        height / 2 - focal * cameraPoint[1] / cameraPoint[2] - match.y2) > 5) continue;
-      let nearest = null, distance = 7 * 7;
-      for (const feature of current.features) {
-        const squared = (feature.x - match.x2) ** 2 + (feature.y - match.y2) ** 2;
-        if (squared < distance) { nearest = feature; distance = squared; }
-      }
-      if (nearest) current.landmarks.set(id(nearest), { ...nearest, world });
-    }
-    this.pose = current.pose;
-    this.previous = current;
-    this.misses = 0;
-    this.gyroTravel = 0;
-    for (let axis = 0; axis < 2; axis++) this.flow[axis] = median(pairs.map((pair) => axis ? pair.y2 - pair.y1 : pair.x2 - pair.x1));
-    const older = this.keyframes.slice(-3, -1).reverse();
-    this.keyframes.push(current);
-    if (this.keyframes.length > 6) this.keyframes.shift();
-    metrics.keyframes = ++this.keyframeCount;
-    metrics.inliers = anchored ? refined.inliers : estimate.inliers;
-    metrics.landmarks = current.landmarks.size;
-    metrics.tracking = anchored ? 'anchored' : 'relative';
-    const tracks = [...current.landmarks.values()].flatMap((point) => [point.x, point.y]);
 
-    if (reference.landmarks.size >= 8) {
-      const sparse = [...reference.landmarks.values()];
-      const neighbors = [current, ...older];
-      const depth = estimateDenseDepth(reference, neighbors, sparse, focal);
-      const valid = depth.confidence.reduce((total, value) => total + (value > 0 ? 1 : 0), 0);
-      metrics.depthPixels = valid;
-      if (valid > 150) {
-        this.volume.integrate(depth, reference, focal);
-        metrics.voxels = this.volume.cells.size;
-        const mesh = this.volume.mesh();
-        if (mesh.positions.length >= 90) {
-          this.fused = true;
-          return { type: 'volume', ...mesh, pose: current.pose, focal, width, height, metrics, tracks };
+    const previous = this.previous;
+    let pairs = match(previous.gray, gray, previous.tracks, width, height, this.flow);
+    if (pairs.length < 12 && (this.flow[0] || this.flow[1])) pairs = match(previous.gray, gray, previous.tracks, width, height);
+    pairs = consistent(pairs, this.random);
+    const old = new Map(previous.tracks.map((track) => [key(track), track]));
+    for (const pair of pairs) {
+      const track = old.get(`${pair.x1}:${pair.y1}`);
+      if (track) current.tracks.push({ ...track, x: pair.x2, y: pair.y2 });
+    }
+    const followed = current.tracks.length;
+    const stride = Math.max(1, Math.ceil(features.length / Math.max(1, 240 - current.tracks.length)));
+    for (let offset = 0; offset < stride && current.tracks.length < 240; offset++) {
+      for (let i = offset; i < features.length && current.tracks.length < 240; i += stride) {
+        const feature = features[i];
+        if (current.tracks.every((track) => Math.hypot(track.x - feature.x, track.y - feature.y) >= 10)) {
+          current.tracks.push({ ...feature, id: ++this.nextId });
         }
       }
     }
-    if (this.fused) return { type: 'pose', pose: current.pose, focal, width, height, metrics, tracks, message: 'Building a continuous surface' };
-
-    const faces = meshFaces(points, width, height);
-    const positions = new Float32Array(faces.length * 9);
-    const colors = new Float32Array(faces.length * 9);
-    let offset = 0;
-    for (const face of faces) for (const index of face) {
-      const point = points[index];
-      positions.set([point.world[0], point.world[1], -point.world[2]], offset);
-      const pixel = (Math.round(point.y) * width + Math.round(point.x)) * 4;
-      colors.set([reference.rgba[pixel] / 255, reference.rgba[pixel + 1] / 255, reference.rgba[pixel + 2] / 255], offset);
-      offset += 3;
+    this.previous = current;
+    const metrics = { tracking: 'image', matches: followed, features: current.tracks.length, landmarks: 0, displacementPx: 0 };
+    const visible = current.tracks.slice(0, followed);
+    const result = (message, pose) => ({ type: 'tracking', tracks: visible.flatMap(({ x, y }) => [x, y]),
+      trackIds: visible.map(({ id }) => id),
+      landmarks: pose ? current.tracks.filter((track) => track.world).map(({ id, x, y, world }) => ({ id, x, y, world })) : [],
+      width, height, focal, pose, metrics, message });
+    if (followed < 10) {
+      this.flow = [0, 0];
+      this.keyframe = current;
+      return result('Reacquiring features; point at a detailed area');
     }
-    return { type: faces.length ? 'patch' : 'pose', positions, colors, pose: current.pose, focal, width, height, metrics, tracks, message: 'Searching for connected surfaces' };
+    for (let axis = 0; axis < 2; axis++) this.flow[axis] = median(pairs.map((pair) => axis ? pair.y2 - pair.y1 : pair.x2 - pair.x1));
+
+    const observations = current.tracks.slice(0, followed).flatMap((track) => track.world ? [{ point: track.world, x: track.x, y: track.y }] : []);
+    let refined = refinePose(observations, previous.pose, focal, width, height);
+    if (refined && refined.errorPx < 3.5 && refined.inliers >= Math.max(10, observations.length * 0.5)
+      && Math.hypot(...refined.C.map((value, i) => value - previous.pose.C[i])) < 0.5) {
+      current.pose = refined;
+      metrics.tracking = 'anchored';
+    }
+
+    const reference = this.keyframe;
+    const byId = new Map(current.tracks.map((track) => [track.id, track]));
+    const shared = reference.tracks.flatMap((track) => {
+      const now = byId.get(track.id);
+      return now ? [{ x1: track.x, y1: track.y, x2: now.x, y2: now.y, id: track.id }] : [];
+    });
+    if (shared.length) metrics.displacementPx = median(shared.map((pair) => Math.hypot(pair.x2 - pair.x1, pair.y2 - pair.y1)));
+    if (metrics.tracking === 'image' && shared.length >= 25 && metrics.displacementPx >= 8 && (this.frame % 3 === 0 || metrics.displacementPx >= 16)) {
+      const estimate = estimatePose(shared, width, height, this.random, focal);
+      if (estimate) {
+        current.pose = advancePose(reference.pose, estimate);
+        metrics.tracking = 'relative';
+        const source = new Map(reference.tracks.map((track) => [key(track), track.id]));
+        for (const point of estimate.points) {
+          const track = byId.get(source.get(key(point)));
+          if (track && !track.world) track.world = mul3(transpose3(reference.pose.R), point.point)
+            .map((value, i) => reference.pose.C[i] + value * 0.2);
+        }
+      }
+    }
+    if (metrics.tracking === 'anchored' && shared.length >= 12 && metrics.displacementPx >= 8) {
+      const candidates = shared.filter((pair) => !byId.get(pair.id).world).map((pair) => ({
+        ...pair, x: pair.x1, y: pair.y1,
+        a: [(pair.x1 - width / 2) / focal, (height / 2 - pair.y1) / focal, 1],
+        b: [(pair.x2 - width / 2) / focal, (height / 2 - pair.y2) / focal, 1],
+      }));
+      for (const point of worldPoints(candidates, reference.pose, current.pose, [])) {
+        byId.get(point.id).world = point.world;
+      }
+    }
+    if (metrics.tracking !== 'image') {
+      for (const track of current.tracks) if (track.world) {
+        const camera = mul3(current.pose.R, track.world.map((value, i) => value - current.pose.C[i]));
+        if (camera[2] <= 0 || Math.hypot(width / 2 + focal * camera[0] / camera[2] - track.x,
+          height / 2 - focal * camera[1] / camera[2] - track.y) > 6) delete track.world;
+      }
+      this.pose = current.pose;
+      if (metrics.displacementPx >= 12 || shared.length < 50) this.keyframe = current;
+    } else if (shared.length < 25) this.keyframe = current;
+    metrics.landmarks = current.tracks.filter((track) => track.world).length;
+    const message = metrics.tracking === 'anchored' ? `3D pose locked - ${followed} visual tracks`
+      : metrics.tracking === 'relative' ? `3D pose initialized - ${followed} visual tracks`
+        : `Tracking ${followed} points - move sideways for 3D pose`;
+    return result(message, metrics.tracking === 'image' ? null : current.pose);
   }
 }

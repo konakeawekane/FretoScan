@@ -8,7 +8,7 @@ function sample(image, width, height, x, y) {
   return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
 }
 
-export function estimateDenseDepth(reference, neighbors, landmarks, focal, step = 2) {
+export function estimateDenseDepth(reference, neighbors, landmarks, focal, step = 2, prior = null) {
   const { width, height, gray, pose } = reference;
   const outWidth = Math.floor(width / step), outHeight = Math.floor(height / step);
   const depths = new Float32Array(outWidth * outHeight);
@@ -26,6 +26,7 @@ export function estimateDenseDepth(reference, neighbors, landmarks, focal, step 
     t: mul3(view.pose.R, pose.C.map((value, i) => value - view.pose.C[i])),
   }));
   const offsets = [[0, 0], [-2, 0], [2, 0], [0, -2], [0, 2], [-2, -2], [2, -2], [-2, 2], [2, 2]];
+  const priorRadius = Math.max(20, width / 320 * 35);
 
   for (let oy = 2; oy < outHeight - 2; oy++) for (let ox = 2; ox < outWidth - 2; ox++) {
     const x = ox * step, y = oy * step;
@@ -35,13 +36,15 @@ export function estimateDenseDepth(reference, neighbors, landmarks, focal, step 
     const centered = referenceValues.map((value) => value - referenceMean);
     const referenceVariance = centered.reduce((sum, value) => sum + value * value, 0);
     if (referenceVariance < 150) continue;
-    let closest = null, distance = 35 * 35;
-    for (const point of sparse) {
+    let closest = null, distance = priorRadius * priorRadius;
+    const guess = prior?.[y * width + x];
+    if (guess > 0) closest = { depth: guess, prior: true };
+    else for (const point of sparse) {
       const squared = (point.x - x) ** 2 + (point.y - y) ** 2;
       if (squared < distance) { closest = point; distance = squared; }
     }
-    const lower = closest ? Math.max(near, closest.depth * 0.65) : near;
-    const upper = closest ? Math.min(far, closest.depth * 1.4) : far;
+    const lower = closest ? Math.max(near * (closest.prior ? 0.6 : 1), closest.depth * (closest.prior ? 0.75 : 0.65)) : near;
+    const upper = closest ? Math.min(far * (closest.prior ? 1.6 : 1), closest.depth * (closest.prior ? 1.33 : 1.4)) : far;
     if (upper <= lower * 1.05) continue;
     const costs = new Float32Array(28).fill(2);
     let best = Infinity, bestLevel = -1;
@@ -49,7 +52,7 @@ export function estimateDenseDepth(reference, neighbors, landmarks, focal, step 
       const inverse = 1 / lower + (1 / upper - 1 / lower) * level / 27;
       const candidate = 1 / inverse;
       const ray = [(x - width / 2) / focal * candidate, (height / 2 - y) / focal * candidate, candidate];
-      let cost = 0, usable = 0;
+      const viewCosts = [];
       for (const view of views) {
         const point = mul3(view.R, ray).map((value, i) => value + view.t[i]);
         if (point[2] <= 0) continue;
@@ -66,11 +69,13 @@ export function estimateDenseDepth(reference, neighbors, landmarks, focal, step 
         }
         const variance = squared - sum * sum / offsets.length;
         if (variance < 150) continue;
-        cost += 1 - cross / Math.sqrt(referenceVariance * variance);
-        usable++;
+        viewCosts.push(1 - cross / Math.sqrt(referenceVariance * variance));
       }
-      if (!usable) continue;
-      costs[level] = cost / usable;
+      if (!viewCosts.length) continue;
+      viewCosts.sort((a, b) => a - b);
+      const count = Math.min(2, viewCosts.length);
+      costs[level] = (viewCosts[0] + (count === 2 ? viewCosts[1] : 0)) / count
+        + (views.length > 1 && count === 1 ? 0.08 : 0);
       if (costs[level] < best) { best = costs[level]; bestLevel = level; }
     }
     if (best > 0.38 || bestLevel < 0) continue;

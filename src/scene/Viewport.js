@@ -23,11 +23,11 @@ export class Viewport {
     this.scene.add(this.grid);
     this.meshes = new THREE.Group();
     this.scene.add(this.meshes);
-    this.material = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: true, opacity: 0.78, depthWrite: false });
+    this.material = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
     this.selected = new Map();
     this.seen = new Set();
     this.triangles = 0;
-    this.limit = 18000;
+    this.limit = 120000;
     this.eraseMode = false;
     this.cameraActive = false;
     this.raycaster = new THREE.Raycaster();
@@ -119,7 +119,7 @@ export class Viewport {
   setTracks(tracks, width, height, tracking) {
     if (!this.cameraActive) return;
     this.trackData = { tracks, width, height };
-    this.trackingPoints.material.color.setHex(tracking === 'anchored' ? 0x9df7dd : 0xffd68a);
+    this.trackingPoints.material.color.setHex(tracking === 'anchored' ? 0x9df7dd : tracking === 'relative' ? 0x8dd5ff : 0xffd68a);
     this.updateTracks();
   }
 
@@ -238,7 +238,25 @@ export class Viewport {
 
   replaceMesh(positions, colors) {
     this.clearMesh();
-    this.addPatch(positions, colors, false);
+    const faces = Math.min(Math.floor(positions.length / 9), this.limit);
+    if (!faces) return;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions.subarray(0, faces * 9), 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors.subarray(0, faces * 9), 3));
+    const mesh = new THREE.Mesh(geometry, this.material);
+    mesh.userData.colors = Float32Array.from(colors.subarray(0, faces * 9));
+    mesh.userData.keys = Array.from({ length: faces }, (_, index) => index);
+    this.meshes.add(mesh);
+    this.triangles = faces;
+    const bounds = new THREE.Box3().setFromObject(this.meshes);
+    if (bounds.isEmpty()) return;
+    const center = bounds.getCenter(new THREE.Vector3());
+    const radius = Math.max(bounds.getSize(new THREE.Vector3()).length() / 2, 0.2);
+    const distance = radius / (Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)) * Math.min(1, this.camera.aspect)) * 1.3;
+    this.camera.position.copy(center).add(new THREE.Vector3(distance * 0.5, distance * 0.35, distance));
+    this.camera.lookAt(center);
+    this.controls.target.copy(center);
+    this.controls.update();
   }
 
   async exportMesh(format) {

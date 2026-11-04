@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Bake harness</title>
+  <script type="importmap">
+    {"imports":{"three":"https://unpkg.com/three@0.181.0/build/three.module.js"}}
+  </script>
+  <style>body { font: 13px monospace; background: #111; color: #ddd; } canvas { display: block; }</style>
+</head>
+<body>
+  <canvas id="scene" width="640" height="480"></canvas>
+  <pre id="log"></pre>
+  <script type="module">
+    import * as THREE from 'three';
+    import { bakeCapture } from '../src/scan/bake-client.js';
+
+    const log = (...parts) => { document.querySelector('#log').textContent += `${parts.join(' ')}\n`; };
+    window.harness = { done: false, result: null, error: null, progress: [] };
+    const params = new URLSearchParams(location.search);
+    const quality = params.get('quality') || 'half';
+    const neural = params.get('neural') === '1';
+    const seconds = Number(params.get('seconds') || 8);
+
+    const canvas = document.querySelector('#scene');
+    const renderer = new THREE.WebGLRenderer({ canvas, preserveDrawingBuffer: true });
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, 640 / 480, 0.05, 50);
+    let seed = 3;
+    const random = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32);
+    const texture = (hue) => {
+      const c = document.createElement('canvas');
+      c.width = c.height = 256;
+      const g = c.getContext('2d');
+      g.fillStyle = `hsl(${hue},40%,50%)`;
+      g.fillRect(0, 0, 256, 256);
+      for (let i = 0; i < 500; i++) {
+        g.fillStyle = `hsl(${hue + random() * 60},${30 + random() * 50}%,${15 + random() * 70}%)`;
+        g.fillRect(random() * 256, random() * 256, 4 + random() * 22, 4 + random() * 22);
+      }
+      const t = new THREE.CanvasTexture(c);
+      t.colorSpace = THREE.SRGBColorSpace;
+      return t;
+    };
+    const material = (hue) => new THREE.MeshBasicMaterial({ map: texture(hue) });
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(6, 6), material(30));
+    floor.rotation.x = -Math.PI / 2;
+    scene.add(floor);
+    const wall = new THREE.Mesh(new THREE.PlaneGeometry(6, 3), material(200));
+    wall.position.set(0, 1.5, -1.5);
+    scene.add(wall);
+    const box = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.7, 0.7), material(120));
+    box.position.set(-0.4, 0.35, 0);
+    scene.add(box);
+    const ball = new THREE.Mesh(new THREE.SphereGeometry(0.35, 48, 24), material(300));
+    ball.position.set(0.6, 0.35, 0.3);
+    scene.add(ball);
+
+    const stream = canvas.captureStream(0);
+    const track = stream.getVideoTracks()[0];
+    const channel = new MessageChannel();
+    const tick = () => new Promise((resolve) => { channel.port1.onmessage = resolve; channel.port2.postMessage(0); });
+    const type = ['video/mp4;codecs=avc1.42E01E', 'video/webm;codecs=vp8'].find((t) => MediaRecorder.isTypeSupported(t));
+    const recorder = new MediaRecorder(stream, { mimeType: params.get('webm') ? 'video/webm;codecs=vp8' : type });
+    const chunks = [];
+    recorder.ondataavailable = (event) => event.data.size && chunks.push(event.data);
+    const start = performance.now();
+    recorder.start(1000);
+    let rendered = 0;
+    for (let t = 0, last = 0; t < 1;) {
+      const now = performance.now();
+      if (now - last < 33) { await tick(); continue; }
+      last = now;
+      t = Math.min(1, (now - start) / (seconds * 1000));
+      const angle = -0.6 + t * 1.2;
+      camera.position.set(Math.sin(angle) * 2.6, 1.2 + Math.sin(t * Math.PI) * 0.2, Math.cos(angle) * 2.6);
+      camera.lookAt(0.1, 0.35, 0);
+      renderer.render(scene, camera);
+      track.requestFrame();
+      rendered++;
+    }
+    log('rendered', rendered, 'frames');
+    await new Promise((resolve) => { recorder.onstop = resolve; recorder.stop(); });
+    const video = new Blob(chunks, { type: recorder.mimeType });
+    log('recorded', recorder.mimeType, video.size, 'bytes');
+    window.harness.video = video;
+    if (params.get('playback')) delete window.VideoDecoder;
+    const started = performance.now();
+    try {
+      const result = await bakeCapture({ video, data: { durationMs: seconds * 1000, recordStartMs: 0, tracking: [], frames: [] } }, quality, (p) => {
+        window.harness.progress.push(p);
+        if (p.phase !== 'depth' || p.done % 10 === 0) log(JSON.stringify(p));
+      }, new AbortController().signal, { neural });
+      const { positions, colors, ...rest } = result;
+      window.harness.result = { ...rest, triangles: positions.length / 9, seconds: (performance.now() - started) / 1000 };
+      log('result', JSON.stringify(window.harness.result));
+      camera.position.set(Math.sin(-0.6) * 2.6, 1.2, Math.cos(-0.6) * 2.6);
+      camera.lookAt(0.1, 0.35, 0);
+      renderer.render(scene, camera);
+      document.body.append(Object.assign(document.createElement('img'), { src: canvas.toDataURL() }));
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      const preview = new THREE.Scene();
+      preview.background = new THREE.Color(0x202830);
+      preview.add(new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide })));
+      const view = new THREE.PerspectiveCamera(45, 640 / 480, 0.01, 100);
+      const angle = Number(params.get('yaw') || 0);
+      view.position.set(Math.sin(angle) * 0.5, 0, 0.5 - Math.cos(angle) * 0.5);
+      view.lookAt(0, 0, -1);
+      renderer.render(preview, view);
+      document.body.append(Object.assign(document.createElement('img'), { src: canvas.toDataURL() }));
+    } catch (error) {
+      window.harness.error = String(error.stack || error);
+      log('error', window.harness.error);
+    }
+    window.harness.done = true;
+  </script>
+</body>
+</html>

@@ -16,7 +16,7 @@ button:focus-visible { outline: 2px solid #a3e8ff; outline-offset: 3px; }
 .tool { position: relative; z-index: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; width: 62px; min-height: 54px; border: 1px solid transparent; border-radius: 13px; background: transparent; cursor: pointer; font-size: 11px; font-weight: 600; letter-spacing: .02em; }
 .tool svg { width: 21px; height: 21px; }
 .tool:hover, .tool--active, .tool[aria-pressed="true"] { border-color: #ffffff4d; background: #ffffff2a; }
-.tool:disabled { opacity: .5; cursor: wait; }
+.tool:disabled { opacity: .5; cursor: not-allowed; }
 
 .panel { top: calc(87px + env(safe-area-inset-top)); left: 50%; width: min(320px, calc(100vw - 28px)); padding: 18px; border-radius: 18px; transform: translateX(-50%); }
 .panel > * { position: relative; }
@@ -41,5 +41,14 @@ button:focus-visible { outline: 2px solid #a3e8ff; outline-offset: 3px; }
 .calibration-panel label { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 10px; font-size: 12px; }
 .calibration-panel input { position: relative; width: 100%; margin-bottom: 12px; accent-color: #a3e8ff; }
 .calibration-panel p { margin-bottom: 0; }
+#quality-panel { width: min(340px, calc(100vw - 28px)); }
+#quality-panel .options { justify-content: space-between; }
+#quality-panel .quality { flex: 1; }
+.toggle { display: flex; align-items: flex-start; gap: 8px; margin-top: 12px; color: #d4e0e9; font-size: 12px; line-height: 1.4; cursor: pointer; }
+.toggle input { flex: none; width: 18px; height: 18px; margin: 0; accent-color: #a3e8ff; }
+.toggle small { color: #9fb0bd; }
+#bake-progress { display: block; width: 100%; height: 8px; margin: 14px 0 8px; accent-color: #a3e8ff; }
+#bake-status { margin: 0 0 10px; }
+#close-quality { margin-top: 10px; }
 
 @media (max-width: 480px) { .recording-panel { left: 50%; right: auto; bottom: calc(67px + env(safe-area-inset-bottom)); transform: translateX(-50%); } }

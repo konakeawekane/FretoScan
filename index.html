@@ -27,11 +27,11 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 9V5a1 1 0 0 1 1-1h4M15 4h4a1 1 0 0 1 1 1v4M20 15v4a1 1 0 0 1-1 1h-4M9 20H5a1 1 0 0 1-1-1v-4"/><circle cx="12" cy="12" r="3"/></svg>
       <span>Scan</span>
     </button>
-    <button id="erase" class="tool" type="button" aria-pressed="false">
+    <button id="erase" class="tool" type="button" aria-pressed="false" aria-label="Erase, available after mesh bake" disabled title="Available after mesh bake">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m4 15 9-10a2 2 0 0 1 3 0l4 4a2 2 0 0 1 0 3l-7 8H8zM8 20h12"/></svg>
       <span>Erase</span>
     </button>
-    <button id="export" class="tool" type="button" aria-pressed="false">
+    <button id="export" class="tool" type="button" aria-pressed="false" aria-label="Export, available after mesh bake" disabled title="Available after mesh bake">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3v13m0 0-4-4m4 4 4-4M4 17v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
       <span>Export</span>
     </button>
@@ -57,8 +57,27 @@
 
   <section id="recording-panel" class="recording-panel glass" aria-label="Recording downloads" hidden>
     <span>Capture ready</span>
+    <button id="open-quality" class="action" type="button">Build mesh</button>
     <button id="save-video" class="action" type="button">Save video</button>
     <button id="save-motion" class="action" type="button">Save scan data</button>
+  </section>
+
+  <section id="quality-panel" class="panel glass" aria-label="Mesh quality" hidden>
+    <h2>Build mesh</h2>
+    <p id="quality-description">Choose a quality level. Full may take several minutes.</p>
+    <div class="options">
+      <button class="action quality" data-quality="quarter" type="button">Quarter</button>
+      <button class="action quality" data-quality="half" type="button">Half</button>
+      <button class="action quality" data-quality="full" type="button">Full</button>
+    </div>
+    <label class="toggle" for="neural-depth">
+      <input id="neural-depth" type="checkbox">
+      <span>Neural depth for plain surfaces <small>(downloads a ~50 MB model once)</small></span>
+    </label>
+    <progress id="bake-progress" max="100" value="0" hidden></progress>
+    <p id="bake-status" hidden></p>
+    <button id="cancel-bake" class="action" type="button" hidden>Cancel</button>
+    <button id="close-quality" class="action" type="button">Later</button>
   </section>
 
   <section id="replace-panel" class="panel glass" aria-label="New scan confirmation" hidden>
@@ -66,7 +85,7 @@
     <p>Save its video and mesh before starting again. A new scan replaces them.</p>
     <div class="options">
       <button id="replace" class="action" type="button">Start new</button>
-      <button id="keep" class="action" type="button">Keep recording</button>
+      <button id="keep" class="action" type="button">Keep scan</button>
     </div>
   </section>
 
@@ -79,7 +98,7 @@
 
   <div class="status glass" role="status" aria-live="polite">
     <span id="indicator" class="indicator"></span>
-    <span id="message">Tap Scan to use your camera</span>
+    <span id="message">Tap Scan to test camera tracking</span>
     <time id="timer" hidden>00:00</time>
     <button id="calibrate" class="status-button" type="button" aria-label="Camera calibration" aria-expanded="false">⚙</button>
   </div>

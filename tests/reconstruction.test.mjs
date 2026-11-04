@@ -5,6 +5,13 @@ import { detect, grayscale, match } from '../src/scan/features.js';
 import { refinePose } from '../src/scan/tracking.js';
 import { estimateDenseDepth } from '../src/scan/depth.js';
 import { TsdfVolume } from '../src/scan/volume.js';
+import { Scanner } from '../src/scan/pipeline.js';
+import { Baker } from '../src/scan/bake.js';
+import { parseWebm } from '../src/scan/webm.js';
+import { sharpness, KeyframePicker } from '../src/scan/sharpness.js';
+import { alignPrior } from '../src/scan/mono.js';
+import { colmapToScene, trackingScene } from '../src/scan/sfm.js';
+import { removeSmallComponents, simplify } from '../src/scan/mesh.js';
 
 test('recovers a camera step and triangulates points', () => {
   const width = 320, height = 240, focal = 288;
@@ -65,7 +72,32 @@ test('keeps feature tracks through exposure change and larger motion', () => {
   assert.ok(pairs.filter((pair) => pair.x2 - pair.x1 === dx && pair.y2 - pair.y1 === dy).length > pairs.length * 0.8);
 });
 
-test('builds mesh faces from two synthetic camera images', async () => {
+test('keeps image tracking through low motion and reacquires after feature loss', () => {
+  const width = 160, height = 120;
+  let seed = 27;
+  const first = new Uint8Array(width * height * 4);
+  const shifted = new Uint8Array(first.length);
+  for (let i = 0; i < width * height; i++) {
+    const value = ((seed = (seed * 1664525 + 1013904223) >>> 0) >>> 24);
+    first.set([value, value, value, 255], i * 4);
+  }
+  for (let y = 0; y < height; y++) for (let x = 8; x < width; x++) {
+    shifted.set(first.subarray((y * width + x - 8) * 4, (y * width + x - 8) * 4 + 4), (y * width + x) * 4);
+  }
+  const scanner = new Scanner();
+  scanner.process({ width, height, rgba: first });
+  const still = scanner.process({ width, height, rgba: first });
+  assert.ok(still.metrics.matches > 20);
+  assert.equal(still.metrics.tracking, 'image');
+  scanner.process({ width, height, rgba: new Uint8Array(first.length) });
+  scanner.process({ width, height, rgba: first });
+  const recovered = scanner.process({ width, height, rgba: shifted });
+  assert.ok(recovered.metrics.matches > 10);
+  assert.equal(recovered.type, 'tracking');
+  assert.equal(recovered.positions, undefined);
+});
+
+test('keeps tracking through synthetic camera frames without generating geometry', async () => {
   const width = 320, height = 240, focal = 288;
   const first = new Uint8Array(width * height * 4);
   const second = new Uint8Array(first.length);
@@ -100,13 +132,21 @@ test('builds mesh faces from two synthetic camera images', async () => {
   self.onmessage({ data: { type: 'reset', sessionId: 7 } });
   self.onmessage({ data: { type: 'frame', sessionId: 7, width, height, rgba: first } });
   self.onmessage({ data: { type: 'frame', sessionId: 7, width, height, rgba: second } });
-  assert.ok(messages.some((message) => message.type === 'patch' && message.positions.length >= 9));
+  assert.equal(messages.at(-1).type, 'tracking');
+  assert.ok(messages.at(-1).metrics.matches > 25);
+  assert.equal(messages.at(-1).metrics.tracking, 'relative');
+  const ids = new Set(messages.at(-1).trackIds);
+  self.onmessage({ data: { type: 'frame', sessionId: 7, tMs: 300, mediaTime: 0.3, width, height, rgba: third } });
+  assert.equal(messages.at(-1).type, 'tracking');
+  assert.ok(messages.at(-1).metrics.matches > 25);
+  assert.ok(messages.at(-1).tracks.length > 50);
+  assert.ok(messages.at(-1).landmarks.length > 8);
+  assert.equal(messages.at(-1).mediaTime, 0.3);
+  assert.ok(messages.at(-1).trackIds.filter((id) => ids.has(id)).length > 20);
+  assert.equal(messages.at(-1).positions, undefined);
   self.onmessage({ data: { type: 'frame', sessionId: 7, width, height, rgba: third } });
-  assert.ok(messages.at(-1).metrics?.inliers > 10);
-  assert.ok(messages.at(-1).metrics?.landmarks > 5);
-  assert.ok(messages.at(-1).metrics?.depthPixels > 150);
+  assert.ok(messages.at(-1).metrics.matches > 25);
   assert.equal(messages.at(-1).metrics.tracking, 'anchored');
-  assert.equal(messages.at(-1).type, 'volume');
 });
 
 test('refines camera position from persistent landmarks', () => {
@@ -163,4 +203,153 @@ test('fuses depth into a continuous surface mesh', () => {
   for (let i = 2; i < mesh.positions.length; i += 3) z.push(mesh.positions[i]);
   z.sort((a, b) => a - b);
   assert.ok(Math.abs(z[Math.floor(z.length / 2)] + 2) < 0.2);
+});
+
+test('matches keyframes to the nearest live tracking pose', () => {
+  const tracking = Array.from({ length: 30 }, (_, i) => ({
+    tMs: 500 + i * 100, focal: 90, width: 96, height: 72,
+    pose: { R: [1, 0, 0, 0, 1, 0, 0, 0, 1], C: [i * 0.03, 0, 0] },
+    landmarks: Array(8).fill({ id: 1, x: 20, y: 10, world: [0, 0, 2] }),
+  }));
+  const frames = [{ timeS: 0.2, width: 192, height: 144 }, { timeS: 9, width: 192, height: 144 }];
+  const scene = trackingScene(frames, { tracking, recordStartMs: 400 });
+  assert.equal(scene.registered, 1);
+  assert.ok(Math.abs(scene.views[0].C[0] - 0.03) < 1e-9);
+  assert.equal(scene.views[0].focal, 180);
+  assert.deepEqual([scene.views[0].landmarks[0].x, scene.views[0].landmarks[0].y], [40, 20]);
+  assert.equal(scene.views[1], null);
+});
+
+test('parses video blocks from a WebM recording', () => {
+  const element = (id, payload) => {
+    const idBytes = [];
+    for (let value = id; value; value = Math.floor(value / 256)) idBytes.unshift(value & 255);
+    return [...idBytes, 0x80 | payload.length, ...payload];
+  };
+  const unknown = (id, children) => [...element(id, []).slice(0, -1), 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, ...children];
+  const block = (time, key, data) => element(0xa3, [0x81, time >> 8, time & 255, key ? 0x80 : 0, ...data]);
+  const bytes = Uint8Array.from([
+    ...element(0x1a45dfa3, [0x42, 0x86, 0x81, 0x01]),
+    ...unknown(0x18538067, [
+      ...element(0x1549a966, element(0x2ad7b1, [0x0f, 0x42, 0x40])),
+      ...element(0x1654ae6b, element(0xae, [...element(0xd7, [1]), ...element(0x83, [1]), ...element(0x86, [...'V_VP8'].map((c) => c.charCodeAt(0))),
+        ...element(0xe0, [...element(0xb0, [0x01, 0x40]), ...element(0xba, [0xf0])])])),
+      ...unknown(0x1f43b675, [...element(0xe7, [0]), ...block(0, true, [1, 2, 3]), ...block(33, false, [4, 5])]),
+      ...unknown(0x1f43b675, [...element(0xe7, [0x03, 0xe8]), ...block(-10 & 0xffff, false, [6])]),
+    ]),
+  ]);
+  const track = parseWebm(bytes);
+  assert.deepEqual([track.width, track.height, track.configs[0].codec], [320, 240, 'vp8']);
+  assert.deepEqual(track.samples.map(({ timestamp, key }) => [timestamp, key]), [[0, true], [33000, false], [990000, false]]);
+  assert.deepEqual([...track.samples[1].data], [4, 5]);
+});
+
+test('scores sharp frames above blurred ones and keeps one per time slot', () => {
+  const width = 64, height = 48;
+  let seed = 5;
+  const sharp = Uint8Array.from({ length: width * height }, () => ((seed = (seed * 1664525 + 1013904223) >>> 0) >>> 24));
+  const blurred = new Uint8Array(sharp.length);
+  for (let y = 1; y < height - 1; y++) for (let x = 1; x < width - 1; x++) {
+    let sum = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) sum += sharp[(y + dy) * width + x + dx];
+    blurred[y * width + x] = sum / 9;
+  }
+  assert.ok(sharpness(sharp, width, height) > sharpness(blurred, width, height) * 4);
+  const picker = new KeyframePicker(2, 4);
+  assert.deepEqual(picker.offer(0.1, 5), { flush: false, keep: true });
+  assert.deepEqual(picker.offer(0.2, 3), { flush: false, keep: false });
+  assert.deepEqual(picker.offer(0.3, 9), { flush: false, keep: true });
+  assert.deepEqual(picker.offer(0.6, 1), { flush: true, keep: true });
+});
+
+test('aligns relative neural depth to sparse metric points', () => {
+  const width = 40, height = 30;
+  const truth = (x, y) => 1.5 + x * 0.03 + y * 0.01;
+  const prior = new Float32Array(width * height);
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) prior[y * width + x] = (1 / truth(x, y) - 0.1) / 2.5;
+  const anchors = [];
+  for (let i = 0; i < 30; i++) anchors.push({ x: (i * 7) % width, y: (i * 11) % height, depth: truth((i * 7) % width, (i * 11) % height) });
+  for (let i = 0; i < 6; i++) anchors.push({ x: i * 5, y: 3, depth: 9 });
+  const fit = alignPrior(prior, width, height, anchors);
+  assert.ok(fit);
+  assert.ok(Math.abs(fit.scale - 2.5) < 0.01 && Math.abs(fit.shift - 0.1) < 0.01);
+  assert.ok(Math.abs(fit.depth[20 * width + 33] - truth(33, 20)) < 0.01);
+  assert.ok(fit.inliers >= 30);
+});
+
+test('converts COLMAP cameras into the scan convention', () => {
+  const width = 200, height = 100, focal = 150;
+  const cameras = [[0, 0, 0], [0.4, 0, 0]];
+  const world = [[0.2, 0.3, 4], [-0.5, -0.2, 3], [0.6, 0.1, 5]];
+  const poses = new Float64Array(26), keypoints = [[], []], tracks = [], points = [];
+  cameras.forEach((C, i) => {
+    poses.set([1, 1, 0, 0, 0, 1, 0, 0, 0, 1, -C[0], -C[1], -C[2]], i * 13);
+  });
+  world.forEach((X, j) => {
+    points.push(...X, 0.5);
+    tracks.push(2);
+    cameras.forEach((C, i) => {
+      const [x, y, z] = X.map((value, k) => value - C[k]);
+      keypoints[i].push(focal * x / z + width / 2 + 0.5, focal * y / z + height / 2 + 0.5, 0, 0, 0, 0);
+      tracks.push(i, j);
+    });
+  });
+  const scene = colmapToScene({ camera: [focal, width / 2, height / 2], poses, points: Float64Array.from(points), tracks: Int32Array.from(tracks) },
+    keypoints.map((values) => Float32Array.from(values)), 2);
+  assert.equal(scene.registered, 2);
+  const second = scene.views[1];
+  for (const { x, y, world: point } of second.landmarks) {
+    const camera = mul3(second.R, point.map((value, k) => value - second.C[k]));
+    assert.ok(Math.abs(width / 2 + focal * camera[0] / camera[2] - x) < 1e-3);
+    assert.ok(Math.abs(height / 2 - focal * camera[1] / camera[2] - y) < 1e-3);
+  }
+  const depths = scene.views[0].landmarks.map(({ world: point }) => point[2]).sort((a, b) => a - b);
+  assert.ok(Math.abs(depths[1] - 1) < 1e-6);
+});
+
+test('drops floating fragments and decimates large meshes', () => {
+  const positions = [], colors = [], indices = [];
+  const grid = (ox, n) => {
+    const base = positions.length / 3;
+    for (let y = 0; y <= n; y++) for (let x = 0; x <= n; x++) { positions.push(ox + x * 0.01, y * 0.01, 1); colors.push(0.5, 0.5, 0.5); }
+    for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+      const a = base + y * (n + 1) + x;
+      indices.push(a, a + 1, a + n + 2, a, a + n + 2, a + n + 1);
+    }
+  };
+  grid(0, 40);
+  grid(5, 2);
+  const mesh = { positions: Float32Array.from(positions), colors: Float32Array.from(colors), indices: Uint32Array.from(indices) };
+  const cleaned = removeSmallComponents(mesh);
+  assert.equal(cleaned.indices.length / 3, 40 * 40 * 2);
+  const reduced = simplify(cleaned, 800, 0.015);
+  assert.ok(reduced.indices.length / 3 <= 800 && reduced.indices.length / 3 > 100);
+});
+
+test('bakes recorded views into a mesh after capture', () => {
+  const width = 96, height = 72, focal = 86.4, shift = 8;
+  let seed = 39;
+  const first = new Uint8Array(width * height * 4);
+  for (let i = 0; i < width * height; i++) {
+    const value = ((seed = (seed * 1664525 + 1013904223) >>> 0) >>> 24);
+    first.set([value, value, value, 255], i * 4);
+  }
+  const identity = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  const baker = new Baker('half');
+  for (let view = 0; view < 4; view++) {
+    const rgba = new Uint8Array(first.length);
+    for (let y = 0; y < height; y++) for (let x = 0; x < width - shift * view; x++) {
+      const from = (y * width + x + shift * view) * 4;
+      rgba.set(first.subarray(from, from + 4), (y * width + x) * 4);
+    }
+    const landmarks = [];
+    for (let y = 12; y < height - 12; y += 12) for (let x = 24; x < width - 12; x += 12) {
+      landmarks.push({ x: x - shift * view, y, world: [(x - width / 2) * 2 / focal, (height / 2 - y) * 2 / focal, 2] });
+    }
+    baker.addFrame({ width, height, rgba, focal, pose: { R: identity, C: [view * shift * 2 / focal, 0, 0] }, landmarks });
+  }
+  const result = baker.finish();
+  assert.equal(result.metrics.received, 4);
+  assert.ok(result.metrics.fused >= 3);
+  assert.ok(result.positions.length > 300);
 });
