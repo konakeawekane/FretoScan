@@ -1,10 +1,18 @@
 # Scan
 
-A static Three.js site for camera capture and post-capture mesh reconstruction. Live capture tracks image features and camera pose; mesh generation runs after recording.
+A simple Three.js site for camera capture and post-capture mesh reconstruction. Live capture tracks image features and camera pose; mesh generation runs after recording.
 
-## Run
+Developed with the help of Codex.
 
-No package manager or build step is required. For desktop testing:
+## Demo
+
+Simple github pages demo can be found here:
+
+[FretoScan](https://konakeawekane.github.io/FretoScan/)
+
+## Run locally
+
+Clone repository then serve up the page:
 
 ```bash
 python -m http.server 8000
